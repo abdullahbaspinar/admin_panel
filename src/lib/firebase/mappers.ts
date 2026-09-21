@@ -238,9 +238,17 @@ export function questionFromDoc(
   id: string,
   data: Record<string, unknown>,
 ): Question {
-  const stem = (data.stem as Record<string, unknown> | undefined) ?? {};
+  const rawStem = data.stem;
+  const stem =
+    rawStem && typeof rawStem === "object"
+      ? (rawStem as Record<string, unknown>)
+      : {};
   const payload = (data.payload as Record<string, unknown> | undefined) ?? {};
   const options = (payload.options as Record<string, unknown>[] | undefined) ?? [];
+  const stemText =
+    typeof rawStem === "string"
+      ? rawStem
+      : String(stem.text ?? data.text ?? data.question ?? "");
   return {
     id,
     examId: String(data.examId ?? ""),
@@ -248,7 +256,7 @@ export function questionFromDoc(
     topicId: String(data.topicId ?? ""),
     type: (data.type as Question["type"]) ?? "multipleChoice",
     stem: {
-      text: String(stem.text ?? ""),
+      text: stemText,
       imageUrl: (stem.imageUrl as string | null | undefined) ?? null,
     },
     payload: {
@@ -264,7 +272,7 @@ export function questionFromDoc(
     source: (data.source as string | null | undefined) ?? null,
     year: data.year == null ? null : Number(data.year),
     isPremium: Boolean(data.isPremium ?? false),
-    isActive: Boolean(data.isActive ?? true),
+    isActive: data.isActive === false ? false : true,
     version: Number(data.version ?? 1),
     tags: ((data.tags as unknown[]) ?? []).map(String),
   };

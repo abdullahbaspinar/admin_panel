@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { ArrowUpRight } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { ArrowUpRight, Trash2 } from "lucide-react";
 
 import { useExamContext } from "@/components/providers/exam-context";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +15,7 @@ import { EmptyState, PageLoading } from "@/components/ui/states";
 import type { Subject } from "@/lib/domain/types";
 import { getClientDb } from "@/lib/firebase/client";
 import {
+  deleteSubject,
   listSubjects,
   reorderByIds,
   slugifyId,
@@ -22,12 +24,21 @@ import {
 import { FirestorePaths } from "@/lib/firebase/paths";
 
 export default function SubjectsPage() {
-  const { examId, exam, hierarchy } = useExamContext();
+  const router = useRouter();
+  const { examId, exam, hierarchy, loading: examLoading } = useExamContext();
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [form, setForm] = useState({ id: "", name: "", isActive: true });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (examLoading) return;
+    if (hierarchy.mode === "flat_courses") {
+      router.replace("/topics");
+    }
+  }, [examLoading, hierarchy.mode, router]);
 
   async function reload() {
     if (!examId) {
@@ -40,6 +51,7 @@ export default function SubjectsPage() {
   }
 
   useEffect(() => {
+    if (examLoading || hierarchy.mode === "flat_courses") return;
     let cancelled = false;
     void (async () => {
       try {
@@ -55,7 +67,7 @@ export default function SubjectsPage() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [examId]);
+  }, [examId, examLoading, hierarchy.mode]);
 
   async function saveSubject(event: React.FormEvent) {
     event.preventDefault();
@@ -82,7 +94,35 @@ export default function SubjectsPage() {
     }
   }
 
-  if (loading) return <PageLoading />;
+  async function removeSubject(subject: Subject) {
+    if (busy) return;
+    const label = hierarchy.subjectLabel.toLowerCase();
+    if (
+      !window.confirm(
+        `“${subject.name}” silinsin mi?\n\nBu ${label}in tüm konuları, hap bilgileri, flashcard desteleri ve soruları da kalıcı olarak silinir.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteSubject(getClientDb(), subject);
+      if (editingId === subject.id) {
+        setEditingId(null);
+        setForm({ id: "", name: "", isActive: true });
+      }
+      setSubjects((prev) => prev.filter((item) => item.id !== subject.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Silinemedi");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (examLoading || hierarchy.mode === "flat_courses" || loading) {
+    return <PageLoading />;
+  }
 
   if (!examId) {
     return (
@@ -102,11 +142,7 @@ export default function SubjectsPage() {
     <div>
       <PageHeader
         title={hierarchy.subjectLabelPlural}
-        description={
-          hierarchy.mode === "course_topics"
-            ? `${exam?.name ?? ""} · Ders ekle, sonra konularını yönet.`
-            : `${exam?.name ?? ""} · İsteğe bağlı gruplama (çoğu sınavda tek grup yeter).`
-        }
+        description={`${exam?.name ?? ""} · Ders ekle, sonra konularını yönet.`}
       />
 
       <Card className="mb-4">
@@ -202,6 +238,15 @@ export default function SubjectsPage() {
                     <ArrowUpRight className="h-3.5 w-3.5" />
                   </Button>
                 </Link>
+                <Button
+                  type="button"
+                  variant="danger"
+                  disabled={busy}
+                  onClick={() => void removeSubject(subject)}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Sil
+                </Button>
               </div>
             </div>
           )}

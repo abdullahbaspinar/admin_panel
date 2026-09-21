@@ -8,6 +8,7 @@ import {
   updateDoc,
   where,
   writeBatch,
+  type DocumentReference,
   type Firestore,
 } from "firebase/firestore";
 
@@ -20,7 +21,7 @@ import {
   topicFromDoc,
   topicToMap,
 } from "@/lib/firebase/mappers";
-import { contentManifestPath, FirestorePaths } from "@/lib/firebase/paths";
+import { contentManifestPath, FirestorePaths, poolPath, topicCheatsheetPath } from "@/lib/firebase/paths";
 
 function sortByOrder<T extends { sortOrder: number }>(items: T[]) {
   return [...items].sort((a, b) => a.sortOrder - b.sortOrder);
@@ -63,6 +64,26 @@ export async function upsertSubject(db: Firestore, subject: Subject): Promise<vo
   await bumpManifest(db, subject.examId);
 }
 
+/** flat_courses: invisible default bucket so topics always have a subjectId. */
+export async function ensureDefaultSubject(
+  db: Firestore,
+  examId: string,
+  name?: string,
+): Promise<Subject> {
+  const existing = await listSubjects(db, examId);
+  if (existing.length > 0) return existing[0];
+
+  const subject: Subject = {
+    id: `sub_${examId}`,
+    examId,
+    name: name?.trim() || "Dersler",
+    isActive: true,
+    sortOrder: 0,
+  };
+  await upsertSubject(db, subject);
+  return subject;
+}
+
 export async function listTopics(
   db: Firestore,
   opts?: { examId?: string; subjectId?: string },
@@ -78,7 +99,16 @@ export async function listTopics(
       ),
     );
   } else if (opts?.examId) {
-    snap = await getDocs(query(col, where("examId", "==", opts.examId)));
+    try {
+      snap = await getDocs(query(col, where("examId", "==", opts.examId)));
+    } catch {
+      snap = await getDocs(col);
+      return sortByOrder(
+        snap.docs
+          .map((d) => topicFromDoc(d.id, d.data() as Record<string, unknown>))
+          .filter((topic) => topic.examId === opts.examId),
+      );
+    }
   } else {
     snap = await getDocs(col);
   }
@@ -91,6 +121,98 @@ export async function upsertTopic(db: Firestore, topic: Topic): Promise<void> {
   const { id, ...rest } = topic;
   await setDoc(doc(db, FirestorePaths.topics, id), topicToMap(rest), { merge: true });
   await bumpManifest(db, topic.examId);
+}
+
+async function commitDeletes(db: Firestore, refs: DocumentReference[]): Promise<void> {
+  const chunkSize = 400;
+  for (let i = 0; i < refs.length; i += chunkSize) {
+    const batch = writeBatch(db);
+    for (const ref of refs.slice(i, i + chunkSize)) {
+      batch.delete(ref);
+    }
+    await batch.commit();
+  }
+}
+
+export async function deleteTopic(db: Firestore, topic: Topic): Promise<void> {
+  const { id: topicId, examId, subjectId } = topic;
+
+  const [decks, questions] = await Promise.all([
+    getDocs(
+      query(collection(db, FirestorePaths.flashDecks), where("topicId", "==", topicId)),
+    ),
+    getDocs(
+      query(collection(db, FirestorePaths.questions), where("topicId", "==", topicId)),
+    ),
+  ]);
+
+  const questionIds = new Set(questions.docs.map((d) => d.id));
+  const refs: DocumentReference[] = [
+    ...questions.docs.map((d) => d.ref),
+    ...decks.docs.map((d) => d.ref),
+    doc(db, topicCheatsheetPath(topicId)),
+    doc(db, poolPath(examId, subjectId, topicId)),
+    doc(db, FirestorePaths.topics, topicId),
+  ];
+
+  await commitDeletes(db, refs);
+  await stripDeletedQuestionsFromMiniTrials(db, examId, questionIds, topicId);
+  await bumpManifest(db, examId);
+}
+
+export async function deleteSubject(db: Firestore, subject: Subject): Promise<void> {
+  const topics = await listTopics(db, {
+    examId: subject.examId,
+    subjectId: subject.id,
+  });
+  for (const topic of topics) {
+    await deleteTopic(db, topic);
+  }
+  await commitDeletes(db, [doc(db, FirestorePaths.subjects, subject.id)]);
+  await bumpManifest(db, subject.examId);
+}
+
+async function stripDeletedQuestionsFromMiniTrials(
+  db: Firestore,
+  examId: string,
+  deletedQuestionIds: Set<string>,
+  deletedTopicId?: string,
+): Promise<void> {
+  if (deletedQuestionIds.size === 0 && !deletedTopicId) return;
+  try {
+    const snap = await getDocs(
+      query(collection(db, FirestorePaths.miniTrials), where("examId", "==", examId)),
+    );
+    for (const trial of snap.docs) {
+      const data = trial.data() as Record<string, unknown>;
+      const ids = Array.isArray(data.questionIds) ? (data.questionIds as string[]) : [];
+      const topicIds = Array.isArray(data.topicIds) ? (data.topicIds as string[]) : [];
+      const nextIds = ids.filter((id) => !deletedQuestionIds.has(id));
+      const nextTopicIds = deletedTopicId
+        ? topicIds.filter((id) => id !== deletedTopicId)
+        : topicIds;
+      if (nextIds.length === ids.length && nextTopicIds.length === topicIds.length) {
+        continue;
+      }
+      await updateDoc(trial.ref, {
+        questionIds: nextIds,
+        topicIds: nextTopicIds,
+        questionCount: nextIds.length || Number(data.questionCount ?? 0),
+      });
+    }
+  } catch {
+    // Mini deneme temizliği en iyi çaba; ders/soru belgeleri zaten silindi.
+  }
+}
+
+export async function setTopicActive(
+  db: Firestore,
+  topicId: string,
+  examId: string,
+  isActive: boolean,
+): Promise<void> {
+  await updateDoc(doc(db, FirestorePaths.topics, topicId), { isActive });
+  await bumpManifest(db, examId);
 }
 
 export async function reorderByIds(

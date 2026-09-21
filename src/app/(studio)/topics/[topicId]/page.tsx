@@ -2,12 +2,13 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
   FileQuestion,
   Lightbulb,
   SquareStack,
+  Trash2,
 } from "lucide-react";
 
 import { useExamContext } from "@/components/providers/exam-context";
@@ -24,49 +25,93 @@ import {
   type TopicCheatsheet,
 } from "@/lib/domain/types";
 import { getClientDb } from "@/lib/firebase/client";
-import { listTopics } from "@/lib/firebase/catalog-repo";
+import { deleteTopic, listTopics } from "@/lib/firebase/catalog-repo";
 import {
+  deleteQuestion,
   getCheatsheet,
   listFlashDecksForTopic,
-  listQuestionsForTopic,
+  listQuestionsForExam,
 } from "@/lib/firebase/content-repo";
+import { siblingTopicIds } from "@/lib/hierarchy";
 
 export default function TopicHubPage() {
   const params = useParams<{ topicId: string }>();
   const topicId = params.topicId;
-  const { hierarchy } = useExamContext();
+  const router = useRouter();
+  const { hierarchy, examId } = useExamContext();
   const [topic, setTopic] = useState<Topic | null>(null);
   const [sheet, setSheet] = useState<TopicCheatsheet | null>(null);
   const [decks, setDecks] = useState<FlashDeck[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     void (async () => {
       try {
         const db = getClientDb();
-        const topics = await listTopics(db);
+        const topics = await listTopics(db, examId ? { examId } : undefined);
         const found = topics.find((t) => t.id === topicId) ?? null;
         setTopic(found);
-        const [cheatsheet, flashDecks, qs] = await Promise.all([
+        const related = new Set(siblingTopicIds(topics, topicId));
+        const [cheatsheet, flashDecks, examQuestions] = await Promise.all([
           getCheatsheet(db, topicId),
           listFlashDecksForTopic(db, topicId),
-          listQuestionsForTopic(db, topicId),
+          examId ? listQuestionsForExam(db, examId) : Promise.resolve([]),
         ]);
         setSheet(cheatsheet);
         setDecks(flashDecks);
-        setQuestions(qs);
+        setQuestions(
+          examQuestions.filter((question) => related.has(question.topicId)),
+        );
       } catch (err) {
         setError(err instanceof Error ? err.message : "Yüklenemedi");
       } finally {
         setLoading(false);
       }
     })();
-  }, [topicId]);
+  }, [topicId, examId]);
 
   const bulletCount =
     sheet?.sections.reduce((sum, s) => sum + s.bullets.length, 0) ?? 0;
+
+  async function removeTopic() {
+    if (!topic || busy) return;
+    const label = hierarchy.topicLabel.toLowerCase();
+    if (
+      !window.confirm(
+        `“${topic.name}” silinsin mi?\n\nBu ${label}in hap bilgisi, flashcard desteleri ve soruları da kalıcı olarak silinir.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteTopic(getClientDb(), topic);
+      router.push("/topics");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Silinemedi");
+      setBusy(false);
+    }
+  }
+
+  async function removeQuestion(question: Question) {
+    if (busy) return;
+    const preview = question.stem.text.trim().slice(0, 80) || question.id;
+    if (!window.confirm(`“${preview}” silinsin mi?`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await deleteQuestion(getClientDb(), question);
+      setQuestions((prev) => prev.filter((item) => item.id !== question.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Soru silinemedi");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   if (loading) {
     return (
@@ -74,12 +119,15 @@ export default function TopicHubPage() {
     );
   }
 
-  if (error) {
+  if (!topic && error) {
     return <Card className="border-red-200 bg-red-50 text-red-800">{error}</Card>;
   }
 
   return (
     <div>
+      {error ? (
+        <Card className="mb-4 border-red-200 bg-red-50 text-red-800">{error}</Card>
+      ) : null}
       <Breadcrumbs
         items={[
           { label: hierarchy.topicLabelPlural, href: "/topics" },
@@ -90,12 +138,25 @@ export default function TopicHubPage() {
         title={topic?.name ?? topicId}
         description={`Bu ${hierarchy.topicLabel.toLowerCase()}nun tüm mobil içeriği. Hap, flash ve soruları buradan yönet.`}
         actions={
-          <Link href="/topics">
-            <Button variant="secondary" type="button">
-              <ArrowLeft className="h-4 w-4" />
-              {hierarchy.topicLabel} listesi
-            </Button>
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link href="/topics">
+              <Button variant="secondary" type="button">
+                <ArrowLeft className="h-4 w-4" />
+                {hierarchy.topicLabel} listesi
+              </Button>
+            </Link>
+            {topic ? (
+              <Button
+                type="button"
+                variant="danger"
+                disabled={busy}
+                onClick={() => void removeTopic()}
+              >
+                <Trash2 className="h-4 w-4" />
+                {hierarchy.topicLabel} sil
+              </Button>
+            ) : null}
+          </div>
         }
       />
 
@@ -235,14 +296,26 @@ export default function TopicHubPage() {
               {questions.slice(0, 6).map((q) => (
                 <li
                   key={q.id}
-                  className="rounded-lg border border-slate-100 px-3 py-2 text-sm text-slate-700"
+                  className="flex items-start gap-2 rounded-lg border border-slate-100 px-3 py-2 text-sm text-slate-700"
                 >
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="line-clamp-2">{q.stem.text}</span>
-                    <Badge tone={q.isActive ? "success" : "neutral"}>
-                      {q.isActive ? "Aktif" : "Pasif"}
-                    </Badge>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="line-clamp-2">{q.stem.text}</span>
+                      <Badge tone={q.isActive ? "success" : "neutral"}>
+                        {q.isActive ? "Aktif" : "Pasif"}
+                      </Badge>
+                    </div>
                   </div>
+                  <Button
+                    type="button"
+                    variant="danger"
+                    disabled={busy}
+                    className="shrink-0 px-2.5"
+                    onClick={() => void removeQuestion(q)}
+                    aria-label="Soruyu sil"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
                 </li>
               ))}
               {questions.length > 6 ? (

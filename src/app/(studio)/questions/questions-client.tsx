@@ -2,7 +2,9 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { Trash2 } from "lucide-react";
 
+import { QuestionPreview } from "@/components/previews/question-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, PageHeader } from "@/components/ui/card";
@@ -12,9 +14,11 @@ import type { Question, Topic } from "@/lib/domain/types";
 import { getClientDb } from "@/lib/firebase/client";
 import { listTopics, slugifyId } from "@/lib/firebase/catalog-repo";
 import {
-  listQuestionsForTopic,
+  deleteQuestion,
+  listQuestionsForExam,
   saveQuestion,
 } from "@/lib/firebase/content-repo";
+import { siblingTopicIds } from "@/lib/hierarchy";
 
 const OPTION_IDS = ["A", "B", "C", "D", "E"] as const;
 
@@ -47,17 +51,30 @@ export default function QuestionsClient() {
   const { examId } = useExamContext();
   const [topics, setTopics] = useState<Topic[]>([]);
   const [topicId, setTopicId] = useState(initialTopicId);
-  const [questions, setQuestions] = useState<Question[]>([]);
+  const [allQuestions, setAllQuestions] = useState<Question[]>([]);
   const [form, setForm] = useState<Question | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
   const topic = useMemo(
     () => topics.find((t) => t.id === topicId) ?? null,
     [topics, topicId],
   );
 
-  async function reload(nextTopicId?: string) {
+  const relatedTopicIds = useMemo(
+    () => new Set(siblingTopicIds(topics, topicId)),
+    [topics, topicId],
+  );
+
+  const questions = useMemo(
+    () => allQuestions.filter((question) => relatedTopicIds.has(question.topicId)),
+    [allQuestions, relatedTopicIds],
+  );
+
+  const duplicateTopicCount = relatedTopicIds.size;
+
+  async function reload(nextTopicId?: string, keepFormId?: string) {
     const db = getClientDb();
     const list = await listTopics(db, examId ? { examId } : undefined);
     setTopics(list);
@@ -67,10 +84,25 @@ export default function QuestionsClient() {
       list[0]?.id ||
       "";
     setTopicId(id);
-    if (!id) return;
-    const qs = await listQuestionsForTopic(db, id);
-    setQuestions(qs);
+    if (!examId && !id) {
+      setAllQuestions([]);
+      return;
+    }
+    const qs = examId ? await listQuestionsForExam(db, examId) : [];
+    setAllQuestions((prev) => {
+      const merged = new Map(qs.map((question) => [question.id, question]));
+      if (keepFormId) {
+        const local = prev.find((question) => question.id === keepFormId);
+        if (local && !merged.has(keepFormId)) merged.set(local.id, local);
+      }
+      return [...merged.values()];
+    });
     const selected = list.find((t) => t.id === id);
+    if (keepFormId) {
+      const saved = qs.find((question) => question.id === keepFormId);
+      if (saved) setForm(saved);
+      return;
+    }
     if (selected) setForm(blankQuestion(selected));
   }
 
@@ -83,7 +115,8 @@ export default function QuestionsClient() {
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!form || !topic) return;
+    if (!form || !topic || busy) return;
+    setBusy(true);
     setError(null);
     setMessage(null);
     try {
@@ -91,7 +124,7 @@ export default function QuestionsClient() {
       const question: Question = {
         ...form,
         id,
-        examId: topic.examId,
+        examId: topic.examId || examId || "",
         subjectId: topic.subjectId,
         topicId: topic.id,
         payload: {
@@ -100,10 +133,41 @@ export default function QuestionsClient() {
         },
       };
       await saveQuestion(getClientDb(), question);
-      setMessage("Soru kaydedildi · question_pool güncellendi.");
-      await reload(topic.id);
+      setAllQuestions((prev) => {
+        const index = prev.findIndex((item) => item.id === question.id);
+        if (index === -1) return [question, ...prev];
+        return prev.map((item) => (item.id === question.id ? question : item));
+      });
+      setForm(question);
+      setMessage("Soru kaydedildi.");
+      await reload(topic.id, question.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Kayıt başarısız");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeQuestion(question: Question) {
+    if (busy) return;
+    const preview = question.stem.text.trim().slice(0, 80) || question.id;
+    if (!window.confirm(`“${preview}” silinsin mi?\n\nBu soru mini denemelerden de çıkarılır.`)) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      await deleteQuestion(getClientDb(), question);
+      setAllQuestions((prev) => prev.filter((item) => item.id !== question.id));
+      if (form?.id === question.id && topic) {
+        setForm(blankQuestion(topic));
+      }
+      setMessage("Soru silindi.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Silinemedi");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -126,32 +190,51 @@ export default function QuestionsClient() {
             ))}
           </Select>
         </Field>
+        {duplicateTopicCount > 1 ? (
+          <p className="mt-2 text-xs text-amber-800">
+            Aynı adda {duplicateTopicCount} ders var. Sorular birlikte listelenir.
+          </p>
+        ) : null}
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-[1fr_420px]">
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(320px,420px)_minmax(280px,360px)]">
         <Card>
           <h2 className="mb-3 font-semibold">
             Sorular ({questions.length})
           </h2>
           <div className="space-y-2">
             {questions.map((q) => (
-              <button
+              <div
                 key={q.id}
-                type="button"
-                className="w-full rounded-lg border border-slate-100 px-3 py-2 text-left hover:border-teal-200"
-                onClick={() => setForm(q)}
+                className="flex items-start gap-2 rounded-lg border border-slate-100 px-3 py-2 hover:border-teal-200"
               >
-                <div className="flex items-start justify-between gap-2">
-                  <p className="text-sm text-slate-800 line-clamp-2">{q.stem.text}</p>
-                  <div className="flex shrink-0 gap-1">
-                    {q.isPremium ? <Badge tone="warning">Premium</Badge> : null}
-                    <Badge tone={q.isActive ? "success" : "neutral"}>
-                      {q.isActive ? "Aktif" : "Pasif"}
-                    </Badge>
+                <button
+                  type="button"
+                  className="min-w-0 flex-1 text-left"
+                  onClick={() => setForm(q)}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="text-sm text-slate-800 line-clamp-2">{q.stem.text}</p>
+                    <div className="flex shrink-0 gap-1">
+                      {q.isPremium ? <Badge tone="warning">Premium</Badge> : null}
+                      <Badge tone={q.isActive ? "success" : "neutral"}>
+                        {q.isActive ? "Aktif" : "Pasif"}
+                      </Badge>
+                    </div>
                   </div>
-                </div>
-                <p className="mt-1 text-xs text-slate-400">{q.id}</p>
-              </button>
+                  <p className="mt-1 text-xs text-slate-400">{q.id}</p>
+                </button>
+                <Button
+                  type="button"
+                  variant="danger"
+                  disabled={busy}
+                  className="shrink-0 px-2.5"
+                  onClick={() => void removeQuestion(q)}
+                  aria-label="Soruyu sil"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
             ))}
             {questions.length === 0 ? (
               <p className="text-sm text-slate-500">Bu derste soru yok.</p>
@@ -283,21 +366,39 @@ export default function QuestionsClient() {
               {message ? (
                 <p className="text-sm text-emerald-700">{message}</p>
               ) : null}
-              <div className="flex gap-2">
-                <Button type="submit">Kaydet</Button>
+              <div className="flex flex-wrap gap-2">
+                <Button type="submit" disabled={busy}>
+                  Kaydet
+                </Button>
                 {topic ? (
                   <Button
                     type="button"
                     variant="ghost"
+                    disabled={busy}
                     onClick={() => setForm(blankQuestion(topic))}
                   >
                     Yeni
+                  </Button>
+                ) : null}
+                {form.id ? (
+                  <Button
+                    type="button"
+                    variant="danger"
+                    disabled={busy}
+                    onClick={() => void removeQuestion(form)}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    Sil
                   </Button>
                 ) : null}
               </div>
             </form>
           </Card>
         ) : null}
+
+        <div className="xl:sticky xl:top-4">
+          <QuestionPreview question={form} />
+        </div>
       </div>
     </div>
   );

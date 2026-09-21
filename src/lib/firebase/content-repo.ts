@@ -28,7 +28,8 @@ import {
   poolPath,
   topicCheatsheetPath,
 } from "@/lib/firebase/paths";
-import { bumpManifest } from "@/lib/firebase/catalog-repo";
+import { bumpManifest, listTopics } from "@/lib/firebase/catalog-repo";
+import { expandTopicScope, normalizeLabel } from "@/lib/hierarchy";
 
 export async function getCheatsheet(
   db: Firestore,
@@ -99,8 +100,15 @@ export async function saveMiniTrial(
   db: Firestore,
   trial: MiniTrial,
 ): Promise<void> {
-  const questionIds = await rebuildMiniTrialPool(db, trial);
-  const payload: MiniTrial = { ...trial, questionIds };
+  const questionIds =
+    trial.questionIds.length > 0
+      ? trial.questionIds
+      : await rebuildMiniTrialPool(db, trial);
+  const payload: MiniTrial = {
+    ...trial,
+    questionIds,
+    questionCount: questionIds.length || trial.questionCount,
+  };
   const { id, ...rest } = payload;
   await setDoc(doc(db, FirestorePaths.miniTrials, id), miniTrialToMap(rest), {
     merge: true,
@@ -113,7 +121,11 @@ export async function refreshMiniTrialPool(
   trial: MiniTrial,
 ): Promise<string[]> {
   const questionIds = await rebuildMiniTrialPool(db, trial);
-  const { id, ...rest } = { ...trial, questionIds };
+  const { id, ...rest } = {
+    ...trial,
+    questionIds,
+    questionCount: questionIds.length || trial.questionCount,
+  };
   await setDoc(doc(db, FirestorePaths.miniTrials, id), miniTrialToMap(rest), {
     merge: true,
   });
@@ -134,30 +146,39 @@ export async function rebuildMiniTrialPool(
   db: Firestore,
   trial: MiniTrial,
 ): Promise<string[]> {
-  const snap = await getDocs(
-    query(
-      collection(db, FirestorePaths.questions),
-      where("examId", "==", trial.examId),
-      where("isActive", "==", true),
-    ),
-  );
-  let questions = snap.docs.map((d) =>
-    questionFromDoc(d.id, d.data() as Record<string, unknown>),
-  );
+  const all = await listQuestionsForExam(db, trial.examId);
+  let available = all.filter((q) => q.isActive);
   if (trial.topicIds.length > 0) {
-    const allowed = new Set(trial.topicIds);
-    questions = questions.filter((q) => allowed.has(q.topicId));
+    const topics = await listTopics(db, { examId: trial.examId });
+    const allowed = expandTopicScope(topics, trial.topicIds);
+    const names = new Set(
+      [...allowed]
+        .map((id) => topics.find((topic) => topic.id === id)?.name)
+        .filter((name): name is string => Boolean(name))
+        .map(normalizeLabel),
+    );
+    available = available.filter(
+      (q) => allowed.has(q.topicId) || names.has(normalizeLabel(q.topicId)),
+    );
   }
+
   const count = Math.max(1, trial.questionCount);
-  const preferred = questions.filter((q) => q.difficulty === trial.difficulty);
+  const availableIds = new Set(available.map((q) => q.id));
+  const selected = trial.questionIds.filter((id) => availableIds.has(id));
+  if (selected.length > 0) return selected;
+
+  const preferred = available.filter((q) => q.difficulty === trial.difficulty);
   const pool =
     preferred.length >= count
       ? preferred
       : preferred.length > 0
-        ? [...preferred, ...questions.filter((q) => q.difficulty !== trial.difficulty)]
-        : questions;
-  const shuffled = [...pool].sort(() => Math.random() - 0.5);
-  return shuffled.slice(0, count).map((q) => q.id);
+        ? [...preferred, ...available.filter((q) => q.difficulty !== trial.difficulty)]
+        : available;
+  return shuffleQuestions(pool).slice(0, count).map((q) => q.id);
+}
+
+function shuffleQuestions<T>(items: T[]): T[] {
+  return [...items].sort(() => Math.random() - 0.5);
 }
 
 export async function listQuestionsForTopic(
@@ -172,6 +193,112 @@ export async function listQuestionsForTopic(
   );
 }
 
+export async function listQuestionsForExam(
+  db: Firestore,
+  examId: string,
+): Promise<Question[]> {
+  const byId = new Map<string, Question>();
+
+  try {
+    const snap = await getDocs(
+      query(collection(db, FirestorePaths.questions), where("examId", "==", examId)),
+    );
+    for (const d of snap.docs) {
+      byId.set(d.id, questionFromDoc(d.id, d.data() as Record<string, unknown>));
+    }
+  } catch {
+    // Query may fail without a composite index; fall back to per-topic reads.
+  }
+
+  if (byId.size > 0) return [...byId.values()];
+
+  const topics = await listTopics(db, { examId });
+  const results = await Promise.allSettled(
+    topics.map((topic) =>
+      getDocs(
+        query(
+          collection(db, FirestorePaths.questions),
+          where("topicId", "==", topic.id),
+        ),
+      ),
+    ),
+  );
+
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    for (const d of result.value.docs) {
+      byId.set(d.id, questionFromDoc(d.id, d.data() as Record<string, unknown>));
+    }
+  }
+
+  return [...byId.values()];
+}
+
+export async function listQuestionsByIds(
+  db: Firestore,
+  ids: string[],
+): Promise<Question[]> {
+  const unique = [...new Set(ids.filter(Boolean))];
+  if (unique.length === 0) return [];
+
+  const snaps = await Promise.all(
+    unique.map((id) => getDoc(doc(db, FirestorePaths.questions, id))),
+  );
+
+  const byId = new Map<string, Question>();
+  for (const snap of snaps) {
+    if (!snap.exists()) continue;
+    byId.set(
+      snap.id,
+      questionFromDoc(snap.id, snap.data() as Record<string, unknown>),
+    );
+  }
+
+  return unique
+    .map((id) => byId.get(id))
+    .filter((q): q is Question => q != null);
+}
+
+export async function listCheatsheetsForTopics(
+  db: Firestore,
+  topicIds: string[],
+): Promise<TopicCheatsheet[]> {
+  if (topicIds.length === 0) return [];
+  const sheets = await Promise.all(topicIds.map((id) => getCheatsheet(db, id)));
+  return sheets.filter((sheet): sheet is TopicCheatsheet => sheet != null);
+}
+
+export async function listFlashDecksForTopics(
+  db: Firestore,
+  topicIds: string[],
+): Promise<FlashDeck[]> {
+  if (topicIds.length === 0) return [];
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < topicIds.length; i += 30) {
+    chunks.push(topicIds.slice(i, i + 30));
+  }
+
+  const snaps = await Promise.all(
+    chunks.map((chunk) =>
+      getDocs(
+        query(
+          collection(db, FirestorePaths.flashDecks),
+          where("topicId", "in", chunk),
+        ),
+      ),
+    ),
+  );
+
+  return snaps
+    .flatMap((snap) =>
+      snap.docs.map((d) =>
+        flashDeckFromDoc(d.id, d.data() as Record<string, unknown>),
+      ),
+    )
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+}
+
 export async function saveQuestion(
   db: Firestore,
   question: Question,
@@ -182,6 +309,40 @@ export async function saveQuestion(
   });
   await rebuildPool(db, question.examId, question.subjectId, question.topicId);
   await bumpManifest(db, question.examId);
+}
+
+export async function deleteQuestion(
+  db: Firestore,
+  question: Question,
+): Promise<void> {
+  await deleteDoc(doc(db, FirestorePaths.questions, question.id));
+  await rebuildPool(db, question.examId, question.subjectId, question.topicId);
+  await stripQuestionIdsFromMiniTrials(db, question.examId, [question.id]);
+  await bumpManifest(db, question.examId);
+}
+
+async function stripQuestionIdsFromMiniTrials(
+  db: Firestore,
+  examId: string,
+  questionIds: string[],
+): Promise<void> {
+  if (questionIds.length === 0) return;
+  const remove = new Set(questionIds);
+  const trials = await listMiniTrialsForExam(db, examId);
+  await Promise.all(
+    trials.map(async (trial) => {
+      if (!trial.questionIds.some((id) => remove.has(id))) return;
+      const nextIds = trial.questionIds.filter((id) => !remove.has(id));
+      const { id, ...rest } = {
+        ...trial,
+        questionIds: nextIds,
+        questionCount: nextIds.length || trial.questionCount,
+      };
+      await setDoc(doc(db, FirestorePaths.miniTrials, id), miniTrialToMap(rest), {
+        merge: true,
+      });
+    }),
+  );
 }
 
 export async function rebuildPool(
@@ -195,9 +356,4 @@ export async function rebuildPool(
   await setDoc(doc(db, poolPath(examId, subjectId, topicId)), questionPoolToMap(ids), {
     merge: true,
   });
-}
-
-export async function countCollection(db: Firestore, name: string): Promise<number> {
-  const snap = await getDocs(collection(db, name));
-  return snap.size;
 }

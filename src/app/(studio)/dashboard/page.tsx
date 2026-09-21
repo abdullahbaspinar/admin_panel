@@ -5,11 +5,11 @@ import Link from "next/link";
 import {
   ArrowRight,
   BookOpen,
+  FileQuestion,
   Lightbulb,
   ListChecks,
-  Plus,
   SquareStack,
-  FileQuestion,
+  Trash2,
 } from "lucide-react";
 
 import { useExamContext } from "@/components/providers/exam-context";
@@ -17,72 +17,133 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, PageHeader, SectionTitle } from "@/components/ui/card";
 import { EmptyState, PageLoading } from "@/components/ui/states";
-import type { Topic } from "@/lib/domain/types";
-import { getClientDb } from "@/lib/firebase/client";
-import { listTopics } from "@/lib/firebase/catalog-repo";
 import {
-  countCollection,
+  MINI_TRIAL_DIFFICULTY_LABELS,
+  type MiniTrial,
+  type Question,
+  type Topic,
+} from "@/lib/domain/types";
+import { getClientDb } from "@/lib/firebase/client";
+import { deleteTopic, listTopics } from "@/lib/firebase/catalog-repo";
+import {
   listMiniTrialsForExam,
+  listQuestionsForExam,
 } from "@/lib/firebase/content-repo";
-import { FirestorePaths } from "@/lib/firebase/paths";
+
+async function settled<T>(promise: Promise<T>, fallback: T) {
+  try {
+    return { value: await promise, error: null as string | null };
+  } catch (err) {
+    return {
+      value: fallback,
+      error: err instanceof Error ? err.message : "Yüklenemedi",
+    };
+  }
+}
 
 export default function DashboardPage() {
   const { exam, examId, hierarchy, loading: examLoading } = useExamContext();
   const [topics, setTopics] = useState<Topic[]>([]);
-  const [counts, setCounts] = useState({
-    cheatsheets: 0,
-    flashDecks: 0,
-    questions: 0,
-    miniTrials: 0,
-  });
+  const [questions, setQuestions] = useState<Question[]>([]);
+  const [trials, setTrials] = useState<MiniTrial[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!examId) {
       setTopics([]);
+      setQuestions([]);
+      setTrials([]);
+      setError(null);
       setLoading(false);
       return;
     }
+
+    let cancelled = false;
     setLoading(true);
+    setError(null);
+
     void (async () => {
-      try {
-        const db = getClientDb();
-        const [topicList, cheatsheets, flashDecks, questions, miniTrials] =
-          await Promise.all([
-          listTopics(db, { examId }),
-          countCollection(db, FirestorePaths.topicCheatsheets),
-          countCollection(db, FirestorePaths.flashDecks),
-          countCollection(db, FirestorePaths.questions),
-          listMiniTrialsForExam(db, examId),
-        ]);
-        setTopics(topicList);
-        setCounts({
-          cheatsheets,
-          flashDecks,
-          questions,
-          miniTrials: miniTrials.length,
-        });
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Dashboard yüklenemedi");
-      } finally {
-        setLoading(false);
-      }
-    })();
+      const db = getClientDb();
+      const [topicResult, questionResult, trialResult] = await Promise.all([
+        settled(listTopics(db, { examId }), [] as Topic[]),
+        settled(listQuestionsForExam(db, examId), [] as Question[]),
+        settled(listMiniTrialsForExam(db, examId), [] as MiniTrial[]),
+      ]);
+      if (cancelled) return;
+
+      setTopics(topicResult.value);
+      setQuestions(questionResult.value);
+      setTrials(trialResult.value);
+      const errors = [topicResult.error, questionResult.error, trialResult.error].filter(
+        Boolean,
+      );
+      setError(errors.length > 0 ? errors.join(" · ") : null);
+      setLoading(false);
+    })().catch((err) => {
+      if (cancelled) return;
+      setError(err instanceof Error ? err.message : "Özet yüklenemedi");
+      setLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [examId]);
 
-  const activeTopics = useMemo(
-    () => topics.filter((t) => t.isActive).length,
-    [topics],
+  const questionCountByTopic = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const question of questions) {
+      map.set(question.topicId, (map.get(question.topicId) ?? 0) + 1);
+    }
+    return map;
+  }, [questions]);
+
+  const rows = useMemo(
+    () =>
+      topics.map((topic) => ({
+        topic,
+        questions: questionCountByTopic.get(topic.id) ?? 0,
+      })),
+    [topics, questionCountByTopic],
   );
+
+  const activeTopics = topics.filter((topic) => topic.isActive).length;
+  const activeQuestions = questions.filter((question) => question.isActive).length;
+  const publishedTrials = trials.filter((trial) => trial.isActive).length;
+  const topicsWithoutQuestions = rows.filter((row) => row.questions === 0).length;
+
+  async function removeTopic(topic: Topic) {
+    if (busyId) return;
+    const label = hierarchy.topicLabel.toLowerCase();
+    if (
+      !window.confirm(
+        `“${topic.name}” silinsin mi?\n\nBu ${label}in hap bilgisi, flashcard desteleri ve soruları da kalıcı olarak silinir.`,
+      )
+    ) {
+      return;
+    }
+    setBusyId(topic.id);
+    setError(null);
+    try {
+      await deleteTopic(getClientDb(), topic);
+      setTopics((prev) => prev.filter((item) => item.id !== topic.id));
+      setQuestions((prev) => prev.filter((item) => item.topicId !== topic.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Silinemedi");
+    } finally {
+      setBusyId(null);
+    }
+  }
 
   if (examLoading || loading) return <PageLoading label="Özet hazırlanıyor…" />;
 
   if (!examId) {
     return (
       <EmptyState
-        title="Önce bir sınav oluştur"
-        description={`CMS’te içerik sınav bazlı yönetilir. Sınav ekledikten sonra ${hierarchy.topicLabelPlural.toLowerCase()}i yönetebilirsin.`}
+        title="Önce bir sınav seç"
+        description="Sınav seçtikten sonra ders, soru ve mini deneme özeti burada görünür."
         action={
           <Link href="/exams">
             <Button type="button">Sınavlara git</Button>
@@ -95,162 +156,215 @@ export default function DashboardPage() {
   return (
     <div>
       <PageHeader
-        title={exam?.name ? `${exam.name} özeti` : "Özet"}
-        description={
-          hierarchy.mode === "course_topics"
-            ? `${hierarchy.subjectLabel} → ${hierarchy.topicLabel} → hap / flash / soru. Üstten sınav değiştir.`
-            : "Günlük iş akışı: bir derse gir → hap / flash / soru yönet. Üstten sınav değiştir."
-        }
+        title={exam?.name ? `${exam.name}` : "Özet"}
+        description={`${activeTopics} aktif ${hierarchy.topicLabel.toLowerCase()} · ${activeQuestions} soru · ${publishedTrials} yayındaki mini deneme`}
         actions={
-          <Link href="/topics">
-            <Button type="button">
-              {hierarchy.topicLabelPlural}
-              <ArrowRight className="h-4 w-4" />
-            </Button>
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link href="/questions">
+              <Button type="button" variant="secondary">
+                Soru ekle
+              </Button>
+            </Link>
+            <Link href="/mini-trials">
+              <Button type="button">
+                Mini deneme
+                <ArrowRight className="h-4 w-4" />
+              </Button>
+            </Link>
+          </div>
         }
       />
 
       {error ? (
-        <Card className="mb-4 border-red-200 bg-red-50 text-red-800">{error}</Card>
+        <Card className="mb-4 border-amber-200 bg-amber-50 text-sm text-amber-900">
+          Bazı veriler yüklenemedi: {error}
+        </Card>
       ) : null}
 
-      <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-        {[
-          {
-            label: hierarchy.topicLabel,
-            value: topics.length,
-            sub: `${activeTopics} aktif`,
-            href: "/topics",
-            icon: BookOpen,
-          },
-          {
-            label: "Mini deneme",
-            value: counts.miniTrials,
-            href: "/mini-trials",
-            icon: ListChecks,
-          },
-          {
-            label: "Hap bilgi",
-            value: counts.cheatsheets,
-            href: "/cheatsheets",
-            icon: Lightbulb,
-          },
-          {
-            label: "Flash deste",
-            value: counts.flashDecks,
-            href: "/flash-decks",
-            icon: SquareStack,
-          },
-          {
-            label: "Soru",
-            value: counts.questions,
-            href: "/questions",
-            icon: FileQuestion,
-          },
-        ].map((tile) => {
-          const Icon = tile.icon;
-          return (
-            <Link key={tile.label} href={tile.href}>
-              <Card className="h-full transition hover:border-teal-300 hover:shadow-md">
-                <div className="flex items-start justify-between gap-2">
-                  <p className="text-sm text-slate-500">{tile.label}</p>
-                  <Icon className="h-4 w-4 text-slate-400" />
-                </div>
-                <p className="mt-2 text-3xl font-semibold tabular-nums text-slate-900">
-                  {tile.value}
-                </p>
-                {"sub" in tile && tile.sub ? (
-                  <p className="mt-1 text-xs text-slate-400">{tile.sub}</p>
-                ) : null}
-              </Card>
-            </Link>
-          );
-        })}
+      <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatLink
+          href="/topics"
+          label={hierarchy.topicLabelPlural}
+          value={topics.length}
+          hint={`${activeTopics} aktif`}
+          icon={BookOpen}
+        />
+        <StatLink
+          href="/questions"
+          label="Sorular"
+          value={questions.length}
+          hint={`${activeQuestions} yayında`}
+          icon={FileQuestion}
+        />
+        <StatLink
+          href="/mini-trials"
+          label="Mini denemeler"
+          value={trials.length}
+          hint={`${publishedTrials} yayında`}
+          icon={ListChecks}
+        />
+        <StatLink
+          href="/questions"
+          label="Sorusuz ders"
+          value={topicsWithoutQuestions}
+          hint={`soru eklenmesi gereken ${hierarchy.topicLabel.toLowerCase()}`}
+          icon={Lightbulb}
+        />
       </div>
 
       <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-        <QuickLink
-          href="/topics"
-          title={`${hierarchy.topicLabel} hub`}
-          text={
-            hierarchy.mode === "course_topics"
-              ? "Konunun tüm içeriğini tek ekrandan yönet"
-              : "Bir dersin tüm içeriğini tek ekrandan yönet"
-          }
-        />
-        <QuickLink
-          href="/mini-trials"
-          title="Mini denemeler"
-          text="Karışık deneme oluştur, soru havuzunu yönet"
-        />
-        <QuickLink
-          href={`/cheatsheets`}
-          title="Hap bilgi düzenle"
-          text="Bölüm ve maddeleri güncelle"
-        />
-        <QuickLink
-          href="/flash-decks"
-          title="Flashcard desteleri"
-          text="25 kart hedefi ve önizleme"
-        />
+        <QuickAction href="/topics" title={hierarchy.topicLabelPlural} text="Ders ekle, sırala, yayına al" />
+        <QuickAction href="/questions" title="Sorular" text="Ders seçip soru yaz" />
+        <QuickAction href="/mini-trials" title="Mini denemeler" text="Havuzdan seç veya yeni soru ekle" />
+        <QuickAction href="/flash-decks" title="Flashcard" text="Desteleri yönet" />
       </div>
 
       <SectionTitle
         title={hierarchy.topicLabelPlural}
-        description="Hub’a tıkla — hap, flash ve sorular orada."
+        description="Soru sayısı derse göre."
         action={
           <Link href="/topics">
             <Button type="button" variant="secondary">
-              <Plus className="h-4 w-4" />
-              Yönet
+              Tümünü gör
             </Button>
           </Link>
         }
       />
 
-      {topics.length === 0 ? (
+      {rows.length === 0 ? (
         <EmptyState
-          title="Bu sınavda ders yok"
-          description="Ders ekledikten sonra mobilde görünür."
+          title={`Bu sınavda ${hierarchy.topicLabel.toLowerCase()} yok`}
+          description={`${hierarchy.topicLabel} ekledikten sonra özet dolacak.`}
           action={
             <Link href="/topics">
-              <Button type="button">Ders ekle</Button>
+              <Button type="button">{hierarchy.topicLabel} ekle</Button>
             </Link>
           }
         />
       ) : (
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          {topics.slice(0, 9).map((topic) => (
-            <Link key={topic.id} href={`/topics/${topic.id}`}>
-              <Card className="h-full transition hover:border-teal-300">
-                <div className="flex items-start justify-between gap-2">
-                  <p className="font-medium text-slate-900">{topic.name}</p>
-                  <Badge tone={topic.isActive ? "success" : "neutral"}>
-                    {topic.isActive ? "Aktif" : "Pasif"}
-                  </Badge>
-                </div>
-                <p className="mt-2 text-xs text-slate-400">{topic.id}</p>
-              </Card>
-            </Link>
-          ))}
+        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+          <table className="w-full text-left text-sm">
+            <thead className="border-b border-slate-100 bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th className="px-4 py-3 font-medium">{hierarchy.topicLabel}</th>
+                <th className="px-4 py-3 font-medium">Durum</th>
+                <th className="px-4 py-3 font-medium">Soru</th>
+                <th className="px-4 py-3 font-medium" />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.topic.id} className="border-b border-slate-50 last:border-0">
+                  <td className="px-4 py-3 font-medium text-slate-900">{row.topic.name}</td>
+                  <td className="px-4 py-3">
+                    <Badge tone={row.topic.isActive ? "success" : "neutral"}>
+                      {row.topic.isActive ? "Aktif" : "Pasif"}
+                    </Badge>
+                  </td>
+                  <td className="px-4 py-3 tabular-nums text-slate-700">{row.questions}</td>
+                  <td className="px-4 py-3 text-right">
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <Link
+                        href={`/questions?topicId=${row.topic.id}`}
+                        className="text-sm font-medium text-teal-800 hover:underline"
+                      >
+                        Sorular
+                      </Link>
+                      <Button
+                        type="button"
+                        variant="danger"
+                        className="px-2.5"
+                        disabled={busyId != null}
+                        onClick={() => void removeTopic(row.topic)}
+                        aria-label={`${row.topic.name} sil`}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        Sil
+                      </Button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
-      {topics.length > 9 ? (
-        <div className="mt-3 text-center">
-          <Link
-            href="/topics"
-            className="text-sm font-medium text-teal-800 hover:underline"
-          >
-            Tüm {topics.length} dersi gör
-          </Link>
-        </div>
-      ) : null}
+
+      <div className="mt-8">
+        <SectionTitle
+          title="Mini denemeler"
+          action={
+            <Link href="/mini-trials">
+              <Button type="button" variant="secondary">
+                Yönet
+              </Button>
+            </Link>
+          }
+        />
+        {trials.length === 0 ? (
+          <EmptyState
+            title="Mini deneme yok"
+            description="Var olan sorulardan seçerek veya yeni soru yazarak deneme oluştur."
+            action={
+              <Link href="/mini-trials">
+                <Button type="button">Mini deneme ekle</Button>
+              </Link>
+            }
+          />
+        ) : (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {trials.map((trial) => (
+              <Link key={trial.id} href="/mini-trials">
+                <Card className="h-full transition hover:border-teal-300">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-medium text-slate-900">{trial.name}</p>
+                    <Badge tone={trial.isActive ? "success" : "warning"}>
+                      {trial.isActive ? "Yayında" : "Taslak"}
+                    </Badge>
+                  </div>
+                  <p className="mt-2 text-sm text-slate-600">
+                    {MINI_TRIAL_DIFFICULTY_LABELS[trial.difficulty] ?? trial.difficulty}
+                    {" · "}
+                    {trial.questionIds.length} soru
+                  </p>
+                </Card>
+              </Link>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
-function QuickLink({
+function StatLink({
+  href,
+  label,
+  value,
+  hint,
+  icon: Icon,
+}: {
+  href: string;
+  label: string;
+  value: number;
+  hint: string;
+  icon: typeof BookOpen;
+}) {
+  return (
+    <Link href={href}>
+      <Card className="h-full transition hover:border-teal-300 hover:shadow-md">
+        <div className="flex items-start justify-between gap-2">
+          <p className="text-sm text-slate-500">{label}</p>
+          <Icon className="h-4 w-4 text-slate-400" />
+        </div>
+        <p className="mt-2 text-3xl font-semibold tabular-nums text-slate-900">{value}</p>
+        <p className="mt-1 text-xs text-slate-400">{hint}</p>
+      </Card>
+    </Link>
+  );
+}
+
+function QuickAction({
   href,
   title,
   text,
@@ -262,7 +376,12 @@ function QuickLink({
   return (
     <Link href={href}>
       <Card className="h-full transition hover:border-teal-300">
-        <p className="font-medium text-slate-900">{title}</p>
+        <div className="flex items-center justify-between gap-2">
+          <p className="font-medium text-slate-900">{title}</p>
+          {href === "/flash-decks" ? (
+            <SquareStack className="h-4 w-4 text-slate-400" />
+          ) : null}
+        </div>
         <p className="mt-1 text-sm text-slate-500">{text}</p>
       </Card>
     </Link>

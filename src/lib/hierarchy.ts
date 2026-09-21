@@ -73,3 +73,42 @@ export function resolveHierarchy(config?: {
       topicLabel === base.topicLabel ? base.topicLabelPlural : `${topicLabel}lar`,
   };
 }
+
+export function normalizeLabel(value: string): string {
+  return value
+    .toLocaleLowerCase("tr-TR")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function siblingTopicIds(
+  topics: { id: string; name: string }[],
+  topicId: string,
+): string[] {
+  const selected = topics.find((topic) => topic.id === topicId);
+  if (!selected) return topicId ? [topicId] : [];
+  const name = normalizeLabel(selected.name);
+  const ids = topics
+    .filter((topic) => normalizeLabel(topic.name) === name)
+    .map((topic) => topic.id);
+  return ids.length > 0 ? ids : [topicId];
+}
+
+export function expandTopicScope(
+  topics: { id: string; name: string }[],
+  selectedIds: string[],
+): Set<string> {
+  const names = new Set(
+    selectedIds
+      .map((id) => topics.find((topic) => topic.id === id)?.name)
+      .filter((name): name is string => Boolean(name))
+      .map(normalizeLabel),
+  );
+  const ids = new Set(selectedIds);
+  for (const topic of topics) {
+    if (names.has(normalizeLabel(topic.name))) ids.add(topic.id);
+  }
+  return ids;
+}

@@ -130,16 +130,6 @@ export function Sidebar({
 
   const structureNav: NavItem[] = [
     { href: "/exams", label: "Sınavlar", icon: GraduationCap },
-    ...(hierarchy.mode === "course_topics"
-      ? []
-      : [
-          {
-            href: "/subjects",
-            label: hierarchy.subjectLabelPlural,
-            icon: FolderTree,
-            hint: hierarchy.subjectHint,
-          },
-        ]),
   ];
 
   const systemNav: NavItem[] = [

@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, PageHeader } from "@/components/ui/card";
 import { Field, Input, Select, Textarea } from "@/components/ui/field";
 import { PageLoading } from "@/components/ui/states";
+import { CheatsheetPreview } from "@/components/previews/cheatsheet-preview";
 import { useExamContext } from "@/components/providers/exam-context";
 import type { CheatsheetSection, Topic, TopicCheatsheet } from "@/lib/domain/types";
 import { getClientDb } from "@/lib/firebase/client";
@@ -121,7 +122,8 @@ export default function CheatsheetsClient() {
       {loading || !sheet ? (
         <PageLoading label="Hap bilgiler yükleniyor…" />
       ) : (
-        <form onSubmit={onSave} className="space-y-4">
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(280px,380px)]">
+          <form onSubmit={onSave} className="space-y-4">
           <Card className="space-y-3">
             <Field label="Başlık">
               <Input
@@ -225,6 +227,10 @@ export default function CheatsheetsClient() {
           {error ? <p className="text-sm text-red-600">{error}</p> : null}
           {message ? <p className="text-sm text-emerald-700">{message}</p> : null}
         </form>
+          <div className="xl:sticky xl:top-4">
+            <CheatsheetPreview sheet={sheet} />
+          </div>
+        </div>
       )}
     </div>
   );

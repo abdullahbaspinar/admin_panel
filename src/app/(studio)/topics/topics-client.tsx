@@ -9,7 +9,7 @@ import {
 } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { ArrowUpRight, Check, Pencil, Plus, Search, X } from "lucide-react";
+import { ArrowUpRight, Check, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 
 import { useExamContext } from "@/components/providers/exam-context";
 import { Badge } from "@/components/ui/badge";
@@ -21,10 +21,12 @@ import { EmptyState, PageLoading } from "@/components/ui/states";
 import type { Subject, Topic } from "@/lib/domain/types";
 import { getClientDb } from "@/lib/firebase/client";
 import {
+  ensureDefaultSubject,
+  deleteTopic,
   listSubjects,
   listTopics,
   reorderByIds,
-  setActiveFlag,
+  setTopicActive,
   slugifyId,
   upsertTopic,
 } from "@/lib/firebase/catalog-repo";
@@ -35,45 +37,61 @@ export default function TopicsClient() {
   const initialSubjectId = search.get("subjectId") ?? "";
   const { examId, exam, hierarchy } = useExamContext();
 
+  const [defaultSubjectId, setDefaultSubjectId] = useState("");
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [topics, setTopics] = useState<Topic[]>([]);
   const [subjectFilter, setSubjectFilter] = useState(initialSubjectId);
   const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "active" | "inactive">(
+    "all",
+  );
   const [quickName, setQuickName] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   const addSubjectId =
-    (subjectFilter && subjects.some((s) => s.id === subjectFilter)
-      ? subjectFilter
-      : null) ||
-    subjects[0]?.id ||
-    "";
+    hierarchy.mode === "flat_courses"
+      ? defaultSubjectId
+      : (subjectFilter && subjects.some((s) => s.id === subjectFilter)
+          ? subjectFilter
+          : null) ||
+        subjects[0]?.id ||
+        "";
 
   async function reload() {
     if (!examId) {
+      setDefaultSubjectId("");
       setSubjects([]);
       setTopics([]);
       setLoading(false);
       return;
     }
     const db = getClientDb();
-    const subjectList = await listSubjects(db, examId);
-    setSubjects(subjectList);
-    const preferred =
-      (initialSubjectId &&
-      subjectList.some((s) => s.id === initialSubjectId)
-        ? initialSubjectId
-        : null) ||
-      subjectFilter ||
-      subjectList[0]?.id ||
-      "";
-    if (preferred && preferred !== subjectFilter) {
-      setSubjectFilter(preferred);
+
+    if (hierarchy.mode === "flat_courses") {
+      const subject = await ensureDefaultSubject(db, examId, exam?.name);
+      setDefaultSubjectId(subject.id);
+      setSubjects([]);
+    } else {
+      const subjectList = await listSubjects(db, examId);
+      setSubjects(subjectList);
+      const preferred =
+        (initialSubjectId &&
+        subjectList.some((s) => s.id === initialSubjectId)
+          ? initialSubjectId
+          : null) ||
+        subjectFilter ||
+        subjectList[0]?.id ||
+        "";
+      if (preferred && preferred !== subjectFilter) {
+        setSubjectFilter(preferred);
+      }
     }
+
     setTopics(await listTopics(db, { examId }));
     setLoading(false);
   }
@@ -94,7 +112,7 @@ export default function TopicsClient() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [examId, initialSubjectId]);
+  }, [examId, initialSubjectId, hierarchy.mode]);
 
   const subjectName = useMemo(
     () => Object.fromEntries(subjects.map((s) => [s.id, s.name])),
@@ -104,13 +122,26 @@ export default function TopicsClient() {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return topics.filter((t) => {
-      if (subjectFilter && t.subjectId !== subjectFilter) return false;
+      if (
+        hierarchy.mode === "course_topics" &&
+        subjectFilter &&
+        t.subjectId !== subjectFilter
+      ) {
+        return false;
+      }
+      if (statusFilter === "active" && !t.isActive) return false;
+      if (statusFilter === "inactive" && t.isActive) return false;
       if (!q) return true;
       return (
         t.name.toLowerCase().includes(q) || t.id.toLowerCase().includes(q)
       );
     });
-  }, [topics, query, subjectFilter]);
+  }, [topics, query, subjectFilter, statusFilter, hierarchy.mode]);
+
+  const activeCount = useMemo(
+    () => topics.filter((t) => t.isActive).length,
+    [topics],
+  );
 
   async function quickAdd(event?: FormEvent) {
     event?.preventDefault();
@@ -118,6 +149,7 @@ export default function TopicsClient() {
     if (!examId || !name || !addSubjectId || busy) return;
     setBusy(true);
     setError(null);
+    setMessage(null);
     try {
       await upsertTopic(getClientDb(), {
         id: slugifyId(name, "top"),
@@ -128,6 +160,7 @@ export default function TopicsClient() {
         sortOrder: topics.length,
       });
       setQuickName("");
+      setMessage(`“${name}” eklendi.`);
       await reload();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Eklenemedi");
@@ -166,23 +199,48 @@ export default function TopicsClient() {
     }
   }
 
-  async function toggleActive(topic: Topic) {
+  async function setActive(topic: Topic, isActive: boolean) {
+    if (!examId || busy || topic.isActive === isActive) return;
     setBusy(true);
     setError(null);
+    setMessage(null);
     try {
-      await setActiveFlag(
-        getClientDb(),
-        FirestorePaths.topics,
-        topic.id,
-        !topic.isActive,
-      );
+      await setTopicActive(getClientDb(), topic.id, examId, isActive);
       setTopics((prev) =>
-        prev.map((t) =>
-          t.id === topic.id ? { ...t, isActive: !t.isActive } : t,
-        ),
+        prev.map((t) => (t.id === topic.id ? { ...t, isActive } : t)),
+      );
+      setMessage(
+        isActive
+          ? `“${topic.name}” yayında — mobilde görünür.`
+          : `“${topic.name}” pasif — mobilde gizlendi.`,
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Durum güncellenemedi");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function removeTopic(topic: Topic) {
+    if (busy) return;
+    const label = hierarchy.topicLabel.toLowerCase();
+    if (
+      !window.confirm(
+        `“${topic.name}” silinsin mi?\n\nBu ${label}in hap bilgisi, flashcard desteleri ve soruları da kalıcı olarak silinir.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      if (editingId === topic.id) setEditingId(null);
+      await deleteTopic(getClientDb(), topic);
+      setTopics((prev) => prev.filter((t) => t.id !== topic.id));
+      setMessage(`“${topic.name}” silindi.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Silinemedi");
     } finally {
       setBusy(false);
     }
@@ -229,14 +287,13 @@ export default function TopicsClient() {
     );
   }
 
-  const showSubjectFilter =
-    hierarchy.mode === "course_topics" || subjects.length > 1;
+  const showSubjectFilter = hierarchy.mode === "course_topics";
 
   return (
     <div>
       <PageHeader
         title={hierarchy.topicLabelPlural}
-        description={`${exam?.name ?? examId} · Ad yaz → Enter. İsme tıkla → yeniden adlandır. Rozete tıkla → aktif/pasif.`}
+        description={`${exam?.name ?? examId} · ${activeCount} aktif / ${topics.length} toplam. Pasif dersler mobilde görünmez; sil kalıcıdır.`}
       />
 
       <Card className="mb-4">
@@ -251,9 +308,6 @@ export default function TopicsClient() {
                   value={subjectFilter}
                   onChange={(e) => setSubjectFilter(e.target.value)}
                 >
-                  {hierarchy.mode === "flat_courses" ? (
-                    <option value="">Tümü</option>
-                  ) : null}
                   {subjects.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.name}
@@ -282,18 +336,11 @@ export default function TopicsClient() {
             Ekle
           </Button>
         </form>
-        {!addSubjectId ? (
-          <p className="mt-2 text-sm text-amber-700">
-            Önce bir {hierarchy.subjectLabel.toLowerCase()} ekle →{" "}
-            <Link href="/subjects" className="underline">
-              {hierarchy.subjectLabelPlural}
-            </Link>
-          </p>
-        ) : null}
+        {message ? <p className="mt-2 text-sm text-teal-700">{message}</p> : null}
         {error ? <p className="mt-2 text-sm text-red-600">{error}</p> : null}
       </Card>
 
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
         <div className="relative min-w-0 flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
           <Input
@@ -303,7 +350,21 @@ export default function TopicsClient() {
             onChange={(e) => setQuery(e.target.value)}
           />
         </div>
-        <p className="text-sm tabular-nums text-slate-500">
+        <div className="w-full sm:w-auto sm:min-w-[10rem]">
+          <Field label="Durum">
+            <Select
+              value={statusFilter}
+              onChange={(e) =>
+                setStatusFilter(e.target.value as "all" | "active" | "inactive")
+              }
+            >
+              <option value="all">Tümü</option>
+              <option value="active">Yayında</option>
+              <option value="inactive">Pasif</option>
+            </Select>
+          </Field>
+        </div>
+        <p className="pb-2 text-sm tabular-nums text-slate-500">
           {filtered.length} / {topics.length}
         </p>
       </div>
@@ -380,22 +441,42 @@ export default function TopicsClient() {
                 )}
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => void toggleActive(topic)}
-                  disabled={busy}
-                  title="Aktif / pasif"
-                >
-                  <Badge tone={topic.isActive ? "success" : "neutral"}>
-                    {topic.isActive ? "Aktif" : "Pasif"}
-                  </Badge>
-                </button>
+                <Badge tone={topic.isActive ? "success" : "neutral"}>
+                  {topic.isActive ? "Yayında" : "Pasif"}
+                </Badge>
+                {topic.isActive ? (
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    disabled={busy}
+                    onClick={() => void setActive(topic, false)}
+                  >
+                    Pasif yap
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void setActive(topic, true)}
+                  >
+                    Yayınla
+                  </Button>
+                )}
                 <Link href={`/topics/${topic.id}`}>
                   <Button type="button" variant="secondary">
                     Hub
                     <ArrowUpRight className="h-3.5 w-3.5" />
                   </Button>
                 </Link>
+                <Button
+                  type="button"
+                  variant="danger"
+                  onClick={() => void removeTopic(topic)}
+                  disabled={busy}
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Sil
+                </Button>
               </div>
             </div>
           )}
